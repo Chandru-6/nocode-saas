@@ -1,51 +1,78 @@
-name: entity-collector-ci
+name: entity-collector-dev-ci
+
 on:
   push:
     paths:
       - "services/entity-collector/**"
+      - "commons/**"
+      - "commons-jooq/**"
+      - "commons-security/**"
       - ".github/workflows/collector-dev.yml"
   workflow_dispatch:
 
 jobs:
-  build_and_push:
+  build_and_deploy:
     runs-on: ubuntu-latest
+
     env:
-      OCIR_HOST: <region>.ocir.io
-      OCIR_REPO: <region>.ocir.io/${{ secrets.OCI_TENANCY_NS_DEV }}/entity-collector
-    
+      OCIR_HOST: us-ashburn-1.ocir.io
+      OCIR_REPO: us-ashburn-1.ocir.io/${{ secrets.OCI_TENANCY_NS_DEV }}/entity-collector
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-         distribution: temurin
-         java-version: '21'
+          distribution: temurin
+          java-version: '21'
 
-
-      - name: Build dependencies first
+      - name: Build dependencies
         run: |
           mvn -q -DskipTests clean install -f commons/pom.xml
           mvn -q -DskipTests clean install -f commons-jooq/pom.xml
           mvn -q -DskipTests clean install -f commons-security/pom.xml
 
-
       - name: Build entity-collector jar
-        working-directory: entity-collector
+        working-directory: services/entity-collector
         run: mvn -q -DskipTests clean package
 
       - name: Copy built jar for Dockerfile
         run: |
           mkdir -p target
-          cp entity-collector/target/entity-collector-1.0.0.jar target/
+          cp services/entity-collector/target/entity-collector-1.0.0.jar target/
 
+      - name: Login to OCIR
+        run: echo "${{ secrets.OCI_AUTH_TOKEN_DEV }}" | docker login $OCIR_HOST \
+              -u "${{ secrets.OCI_USERNAME_DEV }}" --password-stdin
 
-     # - name: Login to OCIR
-     #   run: echo "${{ secrets.OCIR_AUTH_TOKEN_DEV }}" | docker login $OCIR_HOST -u "${{ secrets.OCIR_USERNAME_DEV }}" --password-stdin
-
-      - name: Build docker image
+      - name: Build & push image
         run: |
-          docker build -t test/entity-collector-dev:${{ github.sha }} -f entity-collector/Dockerfile .
-          docker tag test/entity-collector-dev:${{ github.sha }} test/entity-collector:latest
-         # docker push $OCIR_REPO:${{ github.sha }}
-         # docker push $OCIR_REPO:latest
+          docker build -t $OCIR_REPO:${{ github.sha }} \
+                       -t $OCIR_REPO:latest \
+                       -f services/entity-collector/Dockerfile .
+          docker push $OCIR_REPO:${{ github.sha }}
+          docker push $OCIR_REPO:latest
+
+      - name: Install OpenVPN
+        run: sudo apt-get update && sudo apt-get install -y openvpn
+
+      - name: Connect to VPN
+        run: |
+          echo "${{ secrets.VPN_CONFIG }}" | base64 --decode > vpn.ovpn
+          sudo openvpn --config vpn.ovpn \
+            --auth-user-pass <(printf "%s\n%s" "${{ secrets.VPN_USER }}" "${{ secrets.VPN_PASS }}") \
+            --daemon
+          sleep 10
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Deploy collector service
+        run: |
+          ssh -o StrictHostKeyChecking=no opc@${{ secrets.DEV_SERVER_IP }} \
+            "bash /home/opc/dev/keepup.sh deploy dev-entity-collector-server $OCIR_REPO:${{ github.sha }}"
